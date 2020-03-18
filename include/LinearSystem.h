@@ -66,6 +66,12 @@ public:
 
   virtual void free_device_pointer() = 0;
   virtual CoeffApplier* device_pointer() = 0;
+  virtual void resetInternalData() {};
+  virtual void applyDirichletBCs(Realm &,
+				 stk::mesh::FieldBase *,
+				 stk::mesh::FieldBase *,
+				 const stk::mesh::PartVector&) {};
+  virtual void finishAssembly(void *, std::vector<void *>, std::string) {};
 };
 
 class LinearSystem
@@ -166,6 +172,7 @@ public:
     return nullptr;
 #endif
   }
+
 
   virtual void sumInto(
     unsigned numEntities,

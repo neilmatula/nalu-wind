@@ -189,6 +189,8 @@ if(NOT ENABLE_CUDA)
     add_test_r(SSTChannelEdge 4)
     add_test_r_rst(SSTTAMSChannelEdge 4)
     add_test_r_rst(SSTTAMSOversetRotCylinder 4)
+    add_test_r(ablNeutralNGPHypre 1)
+    add_test_r(airfoilRANSEdgeHypre 1)
   endif(ENABLE_HYPRE)
 
   if(ENABLE_OPENFAST)
@@ -235,6 +237,13 @@ else(NOT ENABLE_CUDA)
   #=============================================================================
   add_test_r(ablNeutralNGPTrilinos 2)
   add_test_r(conduction_p4 2)
+  add_test_r(airfoilRANSEdgeTrilinos 1)
+
+  if(ENABLE_HYPRE)
+    add_test_r(airfoilRANSEdge 1)
+    add_test_r(airfoilRANSEdgeHypre 1)
+    add_test_r(ablNeutralNGPHypre 1)
+  endif(ENABLE_HYPRE)
 
   if (ENABLE_TIOGA)
     add_test_r(oversetCylNGPTrilinos 2)

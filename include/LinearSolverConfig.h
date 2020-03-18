@@ -47,6 +47,9 @@ public:
   inline bool getWriteMatrixFiles() const
   { return writeMatrixFiles_; }
 
+  inline bool ensureReproducible() const
+  { return ensureReproducible_; }
+
   inline bool recomputePreconditioner() const
   { return recomputePreconditioner_; }
 
@@ -85,6 +88,7 @@ protected:
   bool reusePreconditioner_{false};
   bool useSegregatedSolver_{false};
   bool writeMatrixFiles_{false};
+  bool ensureReproducible_{false};
 };
 
 class TpetraLinearSolverConfig : public LinearSolverConfig
