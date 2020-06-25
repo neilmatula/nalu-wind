@@ -21,6 +21,7 @@ linear_solvers:
     bamg_relax_order: 0
     segregated_solver: yes
     ensure_reproducible: no
+    use_native_cuda_assembly: no
     write_matrix_files: no
 
   # solver for the pressure
@@ -36,6 +37,7 @@ linear_solvers:
     bamg_interp_type: 6
     bamg_cycle_type: 1
     ensure_reproducible: no
+    use_native_cuda_assembly: no
     write_matrix_files:  no
 
 realms:

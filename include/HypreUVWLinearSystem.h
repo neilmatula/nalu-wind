@@ -69,8 +69,8 @@ public:
   {
   public:
     
-    HypreUVWLinSysCoeffApplier(bool ensureReproducible, unsigned numDof,
-			       HypreIntType globalNumRows, int rank, 
+    HypreUVWLinSysCoeffApplier(bool useNativeCudaAssembly, bool ensureReproducible, 
+			       unsigned numDof, HypreIntType globalNumRows, int rank, 
 			       HypreIntType iLower, HypreIntType iUpper,
 			       HypreIntType jLower, HypreIntType jUpper,
 			       HypreIntTypeMapUnorderedMap memory_map,

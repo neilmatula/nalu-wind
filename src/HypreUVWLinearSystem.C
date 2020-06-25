@@ -523,9 +523,10 @@ sierra::nalu::CoeffApplier* HypreUVWLinearSystem::get_coeff_applier()
     /* Build the coeff applier */
     HypreUVWSolver* solver = reinterpret_cast<HypreUVWSolver*>(linearSolver_);
     bool ensureReproducible = solver->getConfig()->ensureReproducible();
+    bool useNativeCudaAssembly = solver->getConfig()->useNativeCudaAssembly();
 
-    hostCoeffApplier.reset(new HypreUVWLinSysCoeffApplier(ensureReproducible, nDim_, globalNumRows_, rank_,
-							  iLower_, iUpper_, jLower_, jUpper_,
+    hostCoeffApplier.reset(new HypreUVWLinSysCoeffApplier(useNativeCudaAssembly, ensureReproducible, nDim_, globalNumRows_, 
+							  rank_, iLower_, iUpper_, jLower_, jUpper_,
 							  memory_map_, row_indices_, mat_row_start_, rhs_row_start_,
 							  numMatPtsToAssembleTotal_, numRhsPtsToAssembleTotal_,
 							  periodic_bc_rows_, entityToLID_, skippedRowsMap_));
@@ -547,9 +548,9 @@ sierra::nalu::CoeffApplier* HypreUVWLinearSystem::get_coeff_applier()
 /*                     Beginning of HypreUVWLinSysCoeffApplier implementations                          */
 /********************************************************************************************************/
 
-  HypreUVWLinearSystem::HypreUVWLinSysCoeffApplier::HypreUVWLinSysCoeffApplier(bool ensureReproducible, unsigned numDof,
-									       HypreIntType globalNumRows, int rank, 
-									       HypreIntType iLower, HypreIntType iUpper,
+  HypreUVWLinearSystem::HypreUVWLinSysCoeffApplier::HypreUVWLinSysCoeffApplier(bool useNativeCudaAssembly, bool ensureReproducible, 
+									       unsigned numDof, HypreIntType globalNumRows, int rank, 
+								    	       HypreIntType iLower, HypreIntType iUpper,
 									       HypreIntType jLower, HypreIntType jUpper,
 									       HypreIntTypeMapUnorderedMap memory_map,
 									       HypreIntTypeView row_indices,
@@ -560,8 +561,8 @@ sierra::nalu::CoeffApplier* HypreUVWLinearSystem::get_coeff_applier()
 									       HypreIntTypeView periodic_bc_rows,
 									       EntityToHypreIntTypeView entityToLID,
 									       HypreIntTypeUnorderedMap skippedRowsMap)
-  : HypreLinSysCoeffApplier(ensureReproducible, numDof, globalNumRows, rank, iLower, iUpper, jLower, jUpper,
-			    memory_map, row_indices, mat_row_start, rhs_row_start,
+  : HypreLinSysCoeffApplier(useNativeCudaAssembly, ensureReproducible, numDof, globalNumRows, rank,
+			    iLower, iUpper, jLower, jUpper, memory_map, row_indices, mat_row_start, rhs_row_start,
 			    numMatPtsToAssembleTotal, numRhsPtsToAssembleTotal,
 			    periodic_bc_rows, entityToLID, skippedRowsMap) {
   

@@ -810,9 +810,10 @@ sierra::nalu::CoeffApplier* HypreLinearSystem::get_coeff_applier()
     /* Build the coeff applier */
     HypreDirectSolver* solver = reinterpret_cast<HypreDirectSolver*>(linearSolver_);
     bool ensureReproducible = solver->getConfig()->ensureReproducible();
+    bool useNativeCudaAssembly = solver->getConfig()->useNativeCudaAssembly();
 
-    hostCoeffApplier.reset(new HypreLinSysCoeffApplier(ensureReproducible, numDof_, globalNumRows_, rank_,
-						       iLower_, iUpper_, jLower_, jUpper_,
+    hostCoeffApplier.reset(new HypreLinSysCoeffApplier(useNativeCudaAssembly, ensureReproducible, numDof_, globalNumRows_,
+						       rank_, iLower_, iUpper_, jLower_, jUpper_,
 						       memory_map_, row_indices_, mat_row_start_, rhs_row_start_,
 						       numMatPtsToAssembleTotal_, numRhsPtsToAssembleTotal_,
 						       periodic_bc_rows_, entityToLID_, skippedRowsMap_));
@@ -833,8 +834,8 @@ sierra::nalu::CoeffApplier* HypreLinearSystem::get_coeff_applier()
 /********************************************************************************************************/
 /*                     Beginning of HypreLinSysCoeffApplier implementations                             */
 /********************************************************************************************************/
-HypreLinearSystem::HypreLinSysCoeffApplier::HypreLinSysCoeffApplier(bool ensureReproducible, unsigned numDof,
-								    HypreIntType globalNumRows, int rank, 
+HypreLinearSystem::HypreLinSysCoeffApplier::HypreLinSysCoeffApplier(bool useNativeCudaAssembly, bool ensureReproducible, 
+								    unsigned numDof, HypreIntType globalNumRows, int rank, 
 								    HypreIntType iLower, HypreIntType iUpper,
 								    HypreIntType jLower, HypreIntType jUpper,
 								    HypreIntTypeMapUnorderedMap memory_map,
@@ -846,8 +847,8 @@ HypreLinearSystem::HypreLinSysCoeffApplier::HypreLinSysCoeffApplier(bool ensureR
 								    HypreIntTypeView periodic_bc_rows,
 								    EntityToHypreIntTypeView entityToLID,
 								    HypreIntTypeUnorderedMap skippedRowsMap)
-  : ensureReproducible_(ensureReproducible), numDof_(numDof), globalNumRows_(globalNumRows),
-    rank_(rank), iLower_(iLower), iUpper_(iUpper), jLower_(jLower), jUpper_(jUpper),
+  : useNativeCudaAssembly_(useNativeCudaAssembly), ensureReproducible_(ensureReproducible), numDof_(numDof),
+    globalNumRows_(globalNumRows), rank_(rank), iLower_(iLower), iUpper_(iUpper), jLower_(jLower), jUpper_(jUpper),
     memory_map_(memory_map), row_indices_(row_indices), mat_row_start_(mat_row_start), rhs_row_start_(rhs_row_start),
     numMatPtsToAssembleTotal_(numMatPtsToAssembleTotal), numRhsPtsToAssembleTotal_(numRhsPtsToAssembleTotal),
     periodic_bc_rows_(periodic_bc_rows), entityToLID_(entityToLID), skippedRowsMap_(skippedRowsMap), devicePointer_(nullptr)
@@ -1083,72 +1084,60 @@ HypreLinearSystem::HypreLinSysCoeffApplier::finishAssembly(void * mat, std::vect
   
 #ifdef KOKKOS_ENABLE_CUDA
 
-  /*********************************************************************/
-  /* Memory Controller : shares temporaries between the Matrix and Rhs */
-  /*********************************************************************/
-
-  HypreIntType n1 = numMatPtsToAssembleTotal_;
-  HypreIntType n2 = numRhsPtsToAssembleTotal_;
-
-  if (!MemController_)
-    MemController_ = new MemoryController<HypreIntType>(name,n1>n2 ? n1 : n2, rank_);
+  /* timers */
+  struct timeval _start, _stop;
 
   /**********/
   /* Matrix */
   /**********/
+  if (!matAssembler_)
+    matAssembler_ = HypreMatrixAssembler::make_HypreMatrixAssembler(useNativeCudaAssembly_, 
+								    name,ensureReproducible_,iLower_,iUpper_,jLower_,jUpper_,
+								    globalNumRows_,globalNumRows_,numMatPtsToAssembleTotal_,rank_,
+								    row_indices_.extent(0), row_indices_, mat_row_start_);
 
-  /* Build the assembler objects */
-  if (!MatAssembler_)
-    MatAssembler_ = new MatrixAssembler<HypreIntType>(name,ensureReproducible_,iLower_,iUpper_,jLower_,jUpper_,
-						      globalNumRows_,globalNumRows_,n1,rank_,
-						      row_indices_.extent(0), row_indices_.data(), mat_row_start_.data());
-
-  /* set the temporaries from the memory controller ... ugly but it works for the time beign */
-  MatAssembler_->setTemporaryDataArrayPtrs(MemController_->get_d_workspace());
-  MatAssembler_->copySrcDataFromKokkos(cols_.data(), vals_.data());
-  MatAssembler_->assemble();
-  MatAssembler_->copyCSRMatrixToHost();  
-
+  matAssembler_->assemble(cols_, vals_);
+  matAssembler_->copyCSRMatrixToHost();  
+    
   /* Cast these to their types ... ugly */
   HYPRE_IJMatrix hmat = *((HYPRE_IJMatrix *)mat);
-
+  
   HypreIntType nr;
   HypreIntType * row_indices;
   HypreIntType * row_counts;
   HypreIntType * col_indices;
   double * values;    
-
+  
   /* record the start time */
-  struct timeval _start, _stop;
   gettimeofday(&_start, NULL);
-
-  if (MatAssembler_->getHasShared()) {
+    
+  if (matAssembler_->getHasShared()) {
     /* Set the owned part */
-    nr = MatAssembler_->getNumRowsOwned();
-    row_indices = MatAssembler_->getHostOwnedRowIndicesPtr();
-    row_counts = MatAssembler_->getHostOwnedRowCountsPtr();
-    col_indices = MatAssembler_->getHostOwnedColIndicesPtr();
-    values = MatAssembler_->getHostOwnedValuesPtr();    
+    nr = matAssembler_->getNumRowsOwned();
+    row_indices = matAssembler_->getHostOwnedRowIndicesPtr();
+    row_counts = matAssembler_->getHostOwnedRowCountsPtr();
+    col_indices = matAssembler_->getHostOwnedColIndicesPtr();
+    values = matAssembler_->getHostOwnedValuesPtr();    
     HYPRE_IJMatrixSetValues(hmat, nr, row_counts, row_indices, col_indices, values);  
-
+      
     /* Add the shared part */
-    nr = MatAssembler_->getNumRowsShared();
-    row_indices = MatAssembler_->getHostSharedRowIndicesPtr();
-    row_counts = MatAssembler_->getHostSharedRowCountsPtr();
-    col_indices = MatAssembler_->getHostSharedColIndicesPtr();
-    values = MatAssembler_->getHostSharedValuesPtr();    
+    nr = matAssembler_->getNumRowsShared();
+    row_indices = matAssembler_->getHostSharedRowIndicesPtr();
+    row_counts = matAssembler_->getHostSharedRowCountsPtr();
+    col_indices = matAssembler_->getHostSharedColIndicesPtr();
+    values = matAssembler_->getHostSharedValuesPtr();    
     HYPRE_IJMatrixAddToValues(hmat, nr, row_counts, row_indices, col_indices, values);  
-
+    
   } else {
     /* No shared part so do the whole thing */
-    nr = MatAssembler_->getNumRows();
-    row_indices = MatAssembler_->getHostRowIndicesPtr();
-    row_counts = MatAssembler_->getHostRowCountsPtr();
-    col_indices = MatAssembler_->getHostColIndicesPtr();
-    values = MatAssembler_->getHostValuesPtr();    
+    nr = matAssembler_->getNumRows();
+    row_indices = matAssembler_->getHostRowIndicesPtr();
+    row_counts = matAssembler_->getHostRowCountsPtr();
+    col_indices = matAssembler_->getHostColIndicesPtr();
+    values = matAssembler_->getHostValuesPtr();    
     HYPRE_IJMatrixSetValues(hmat, nr, row_counts, row_indices, col_indices, values);  
   }
-
+    
   /* record the stop time */
   gettimeofday(&_stop, NULL);
   double msec = (double)(_stop.tv_usec - _start.tv_usec) / 1.e3 + 1.e3*((double)(_stop.tv_sec - _start.tv_sec));
@@ -1158,21 +1147,15 @@ HypreLinearSystem::HypreLinSysCoeffApplier::finishAssembly(void * mat, std::vect
   /********/
   /* Rhs */
   /********/
-
-  /* Build the assembler objects */
-  if (!RhsAssembler_)
-    RhsAssembler_ = new RhsAssembler<HypreIntType>(name,ensureReproducible_,iLower_,iUpper_,globalNumRows_,n2,rank_,
-						   row_indices_.extent(0), row_indices_.data(), rhs_row_start_.data());
-
-  /* set the temporaries from the memory controller ... ugly but it works for the time beign */
-  RhsAssembler_->setTemporaryDataArrayPtrs(MemController_->get_d_workspace());
-
+  if (!rhsAssembler_)
+    rhsAssembler_ = HypreRhsAssembler::make_HypreRhsAssembler(useNativeCudaAssembly_,name,ensureReproducible_,
+							      iLower_,iUpper_,globalNumRows_,numRhsPtsToAssembleTotal_,rank_,
+							      row_indices_.extent(0), row_indices_, rhs_row_start_);
+  
   for (unsigned i=0; i<rhs.size(); ++i) {
-
     /* get the src data from the kokkos views */
-    RhsAssembler_->copySrcDataFromKokkos(&rhs_vals_(0,i));
-    RhsAssembler_->assemble();
-    RhsAssembler_->copyRhsVectorToHost();  
+    rhsAssembler_->assemble(rhs_vals_, i);
+    rhsAssembler_->copyRhsVectorToHost();  
 
     /* record the start time */
     gettimeofday(&_start, NULL);
@@ -1183,27 +1166,26 @@ HypreLinearSystem::HypreLinSysCoeffApplier::finishAssembly(void * mat, std::vect
     HypreIntType * rhs_indices;
     double * rhs_values;
 
-    if (RhsAssembler_->getHasShared()) {
+    if (rhsAssembler_->getHasShared()) {
       /* Set the owned part */
-      nr = RhsAssembler_->getNumRowsOwned();
-      rhs_indices = RhsAssembler_->getHostOwnedRhsIndicesPtr();
-      rhs_values = RhsAssembler_->getHostOwnedRhsPtr();    
+      nr = rhsAssembler_->getNumRowsOwned();
+      rhs_indices = rhsAssembler_->getHostOwnedRhsIndicesPtr();
+      rhs_values = rhsAssembler_->getHostOwnedRhsPtr();    
       HYPRE_IJVectorSetValues(hrhs, nr, rhs_indices, rhs_values);
-      
+	
       /* Add the shared part */
-      nr = RhsAssembler_->getNumRowsShared();
-      rhs_indices = RhsAssembler_->getHostSharedRhsIndicesPtr();
-      rhs_values = RhsAssembler_->getHostSharedRhsPtr();    
+      nr = rhsAssembler_->getNumRowsShared();
+      rhs_indices = rhsAssembler_->getHostSharedRhsIndicesPtr();
+      rhs_values = rhsAssembler_->getHostSharedRhsPtr();    
       HYPRE_IJVectorAddToValues(hrhs, nr, rhs_indices, rhs_values);
-
+      
     } else {
       /* No shared part so do the whole thing */
-      nr = RhsAssembler_->getNumRows();
-      rhs_indices = RhsAssembler_->getHostRhsIndicesPtr();
-      rhs_values = RhsAssembler_->getHostRhsPtr();
+      nr = rhsAssembler_->getNumRows();
+      rhs_indices = rhsAssembler_->getHostRhsIndicesPtr();
+      rhs_values = rhsAssembler_->getHostRhsPtr();
       HYPRE_IJVectorSetValues(hrhs, nr, rhs_indices, rhs_values);
     }
-
     /* record the stop time */
     gettimeofday(&_stop, NULL);
     double msec = (double)(_stop.tv_usec - _start.tv_usec) / 1.e3 + 1.e3*((double)(_stop.tv_sec - _start.tv_sec));

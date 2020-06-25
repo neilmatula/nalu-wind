@@ -25,7 +25,10 @@
 
 #include <unordered_set>
 
-#include "HypreCudaLinearSystemAssembler.h"
+/* the new implementation */
+#include "HypreMatrixAssembler.h"
+#include "HypreRhsAssembler.h"
+
 #include "Kokkos_UnorderedMap.hpp"
 
 #ifndef HYPRE_LINEAR_SYSTEM_TIMER
@@ -158,8 +161,8 @@ public:
   {
   public:
 
-    HypreLinSysCoeffApplier(bool ensureReproducible, unsigned numDof,
-			    HypreIntType globalNumRows, int rank, 
+    HypreLinSysCoeffApplier(bool useNativeCudaAssembly, bool ensureReproducible, 
+			    unsigned numDof, HypreIntType globalNumRows, int rank, 
 			    HypreIntType iLower, HypreIntType iUpper,
 			    HypreIntType jLower, HypreIntType jUpper,
 			    HypreIntTypeMapUnorderedMap memory_map,
@@ -175,9 +178,10 @@ public:
     KOKKOS_FUNCTION
     virtual ~HypreLinSysCoeffApplier() {
 #ifdef KOKKOS_ENABLE_CUDA
-      if (MemController_) { delete MemController_; MemController_=NULL; }
-      if (MatAssembler_) { delete MatAssembler_; MatAssembler_=NULL; }
-      if (RhsAssembler_) { delete RhsAssembler_; RhsAssembler_=NULL; }
+
+      if (matAssembler_) { delete matAssembler_; matAssembler_=NULL; }
+      if (rhsAssembler_) { delete rhsAssembler_; rhsAssembler_=NULL; }
+
 #ifdef HYPRE_LINEAR_SYSTEM_TIMER
       if (_nAssembleMat>0) {
 	printf("\tMean HYPRE_IJMatrixSetValues Time (%d samples)=%1.5f   Total=%1.5f\n",
@@ -235,6 +239,8 @@ public:
     
     virtual void finishAssembly(void * mat, std::vector<void *> rhs, std::string name);
 
+    //! whether or not to enforce reproducibility
+    bool useNativeCudaAssembly_=true;
     //! whether or not to enforce reproducibility
     bool ensureReproducible_=false;
     //! number of degrees of freedom
@@ -296,12 +302,10 @@ public:
     HypreIntTypeViewScalar checkSkippedRows_;
 
 #ifdef KOKKOS_ENABLE_CUDA
-    //! The Memory Controller ... used for temporaries that can be shared between Matrix and Rhs assemblies
-    MemoryController<HypreIntType> * MemController_=nullptr;
-    //! The Matrix assembler
-    MatrixAssembler<HypreIntType> * MatAssembler_=nullptr;
-    //! The Rhs assembler
-    RhsAssembler<HypreIntType> * RhsAssembler_=nullptr;
+
+    /* The new version */
+    HypreRhsAssembler * rhsAssembler_=nullptr;
+    HypreMatrixAssembler * matAssembler_=nullptr;
 
     float _assembleMatTime=0.f;
     float _assembleRhsTime=0.f;

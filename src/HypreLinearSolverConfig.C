@@ -49,6 +49,8 @@ HypreLinearSolverConfig::load(const YAML::Node& node)
 
   get_if_present(node, "ensure_reproducible", ensureReproducible_, ensureReproducible_);
 
+  get_if_present(node, "use_native_cuda_assembly", useNativeCudaAssembly_, useNativeCudaAssembly_);
+
   get_if_present(node, "recompute_preconditioner",
                  recomputePreconditioner_, recomputePreconditioner_);
   get_if_present(node, "reuse_preconditioner",

@@ -50,6 +50,9 @@ public:
   inline bool ensureReproducible() const
   { return ensureReproducible_; }
 
+  inline bool useNativeCudaAssembly() const
+  { return useNativeCudaAssembly_; }
+
   inline bool recomputePreconditioner() const
   { return recomputePreconditioner_; }
 
@@ -89,6 +92,7 @@ protected:
   bool useSegregatedSolver_{false};
   bool writeMatrixFiles_{false};
   bool ensureReproducible_{false};
+  bool useNativeCudaAssembly_{true};
 };
 
 class TpetraLinearSolverConfig : public LinearSolverConfig
