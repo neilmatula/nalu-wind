@@ -9,7 +9,7 @@
 #ifndef HYPRE_RHS_ASSEMBLER_TIMER
 #define HYPRE_RHS_ASSEMBLER_TIMER
 #endif // HYPRE_RHS_ASSEMBLER_TIMER
-#undef HYPRE_RHS_ASSEMBLER_TIMER
+//#undef HYPRE_RHS_ASSEMBLER_TIMER
 
 #include <vector>
 #include <algorithm>
@@ -152,6 +152,9 @@ protected:
 
   /* input meta data */
   std::string _name="";
+  /* whether or not to sort the values data to ensure reproducibility */
+  bool _ensure_reproducible=false;
+  /* row extents for this rank */
   HypreIntType _iLower=0;
   HypreIntType _iUpper=0;
   HypreIntType _global_num_rows=0;
@@ -166,9 +169,6 @@ protected:
 
   /* amount of memory being used */
   HypreIntType _memoryUsed=0;
-
-  /* whether or not to sort the values data to ensure reproducibility */
-  bool _ensure_reproducible=false;
 
   /* whether or not this class contains shared rows for other ranks */
   bool _has_shared=false;
@@ -286,8 +286,12 @@ protected:
 #ifdef HYPRE_RHS_ASSEMBLER_TIMER
   /* timers */
   struct timeval _start, _stop;
+  struct timeval _start_refined, _stop_refined;
   float _assembleTime=0.f;
   float _xferHostTime=0.f;
+  float _fillRhsTime=0.f;
+  float _findOwnedSharedBndryTime=0.f;
+  float _fillOwnedSharedTime=0.f;
   int _nAssemble=0;
 #endif
 
@@ -423,8 +427,12 @@ protected:
 #ifdef HYPRE_RHS_ASSEMBLER_TIMER
   /* cuda timers */
   cudaEvent_t _start, _stop;
+  cudaEvent_t _start_refined, _stop_refined;
   float _assembleTime=0.f;
   float _xferHostTime=0.f;
+  float _fillRhsTime=0.f;
+  float _findOwnedSharedBndryTime=0.f;
+  float _fillOwnedSharedTime=0.f;
   int _nAssemble=0;
 #endif
 

@@ -67,9 +67,16 @@ HypreKokkosRhsAssembler::HypreKokkosRhsAssembler(std::string name, bool ensureRe
 HypreKokkosRhsAssembler::~HypreKokkosRhsAssembler() {
 #ifdef HYPRE_RHS_ASSEMBLER_TIMER
   printf("\nRank %d %s %s %d : name=%s\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
-  if (_nAssemble>0)
+  if (_nAssemble>0) {
     printf("Mean RHS Assembly Time (%d samples)=%1.5f msec, Data Xfer Time To Host=%1.5f msec\n",
 	   _nAssemble,_assembleTime/_nAssemble,_xferHostTime/_nAssemble);
+    printf("\tFill RHS Time (%d samples)=%1.5f msec\n",
+	   _nAssemble,_fillRhsTime/_nAssemble);
+    printf("\tFind Owned/Shared Boundary Time (%d samples)=%1.5f msec\n",
+	   _nAssemble,_findOwnedSharedBndryTime/_nAssemble);
+    printf("\tFill Owned/Shared Time (%d samples)=%1.5f msec\n",
+	   _nAssemble,_fillOwnedSharedTime/_nAssemble);
+  }
 #endif
 }
 
@@ -100,8 +107,7 @@ HypreKokkosRhsAssembler::copyRhsVectorToHost() {
   Kokkos::fence();
   /* record the stop time */
   gettimeofday(&_stop, NULL);
-  float msec = (float)(_stop.tv_usec - _start.tv_usec) / 1.e3 + 1.e3*((float)(_stop.tv_sec - _start.tv_sec));
-  _xferHostTime+=msec;
+  _xferHostTime += (float)(_stop.tv_usec - _start.tv_usec) / 1.e3 + 1.e3*((float)(_stop.tv_sec - _start.tv_sec));
 #endif
 }
 
@@ -127,6 +133,7 @@ HypreKokkosRhsAssembler::assemble(Kokkos::View<double **>& data, const int index
   Kokkos::fence();
   /* record the start time */
   gettimeofday(&_start, NULL);
+  _nAssemble++;
 #endif
 
   /* team for parallel for loops */
@@ -178,14 +185,20 @@ HypreKokkosRhsAssembler::assemble(Kokkos::View<double **>& data, const int index
   /* copy assembly_row_indices to rhs_indices so that rhs_indices can be manipulated by the owned/shared computation */
   Kokkos::deep_copy(_d_rhs_indices, _d_assembly_row_indices);
 
-  /**************************************/
-  /* reduce the right hand size elements*/
+#ifdef HYPRE_RHS_ASSEMBLER_TIMER
+  Kokkos::fence();
+  /* record the start time */
+  gettimeofday(&_start_refined, NULL);
+#endif
+
+  /***************************************/
+  /* reduce the right hand side elements */
+  /***************************************/
   Kokkos::parallel_for(team_exec, KOKKOS_LAMBDA(const DeviceTeamHandleType& team) {
 
       auto rowId = team.league_rank();
       auto begin = assembly_row_start(rowId);
       auto end = assembly_row_start(rowId+1);
-      auto row = assembly_row_indices(rowId);
       auto rowLen = end - begin;
 
       double sum = 0.;
@@ -194,13 +207,19 @@ HypreKokkosRhsAssembler::assemble(Kokkos::View<double **>& data, const int index
 				lsum += d_data(begin+i, index);
 			      }, sum);
 
-      /* sync */
-      team.team_barrier();
-
       /* write the result to memory by thread 0 only */
       if (team.team_rank() == 0) d_rhs(rowId) = sum;
     });      
 
+#ifdef HYPRE_RHS_ASSEMBLER_TIMER
+    Kokkos::fence();
+    /* record the stop time */
+    gettimeofday(&_stop_refined, NULL);
+    _fillRhsTime += (float)(_stop_refined.tv_usec - _start_refined.tv_usec) / 1.e3 + 1.e3*((float)(_stop_refined.tv_sec - _start_refined.tv_sec));
+
+    /* record the start time */
+    gettimeofday(&_start_refined, NULL);
+#endif
 
   /*******************************************************/
   /* Step 3 : split into owned and shared not-owned rows */
@@ -224,6 +243,18 @@ HypreKokkosRhsAssembler::assemble(Kokkos::View<double **>& data, const int index
       if( val < lminloc.val ) { lminloc.val = val; lminloc.loc = i; }
     }, Kokkos::MinLoc<HypreIntType,HypreIntType>(iUppLoc));
 
+
+#ifdef HYPRE_RHS_ASSEMBLER_TIMER
+    Kokkos::fence();
+    /* record the stop time */
+    gettimeofday(&_stop_refined, NULL);
+    _findOwnedSharedBndryTime += (float)(_stop_refined.tv_usec - _start_refined.tv_usec) / 1.e3 + 1.e3*((float)(_stop_refined.tv_sec - _start_refined.tv_sec));
+
+    /* record the start time */
+    gettimeofday(&_start_refined, NULL);
+#endif
+
+
 #ifdef HYPRE_RHS_ASSEMBLER_DEBUG
   Kokkos::deep_copy(_h_rhs_indices, _d_rhs_indices);
 
@@ -237,119 +268,118 @@ HypreKokkosRhsAssembler::assemble(Kokkos::View<double **>& data, const int index
 
 #endif
 
+  /* set these here */
+  _num_rows_owned = _num_rows_this_rank;
+  _num_rows_shared = _num_rows - _num_rows_owned;
+
   /*******************************************************/
   /* Consistency check : make sure things are consistent */
   /*******************************************************/
-  if (_num_rows_owned!=_num_rows)
+  _has_shared=false;
+  if (_num_rows_owned!=_num_rows) {
     _has_shared = true;
-  else {
-    _has_shared=false;
-    return;
+
+    /***************************************/
+    /* allocations, if not already created */
+    /***************************************/
+    if (!_owned_shared_views_created) {
+      _d_rhs_owned = Kokkos::View<double *>("d_rhs_owned",_num_rows_owned);
+      _d_rhs_indices_owned = Kokkos::View<HypreIntType *>("d_rhs_indices_owned",_num_rows_owned);
+      _h_rhs_owned = Kokkos::create_mirror_view(_d_rhs_owned);
+      _h_rhs_indices_owned = Kokkos::create_mirror_view(_d_rhs_indices_owned);
+      
+      _d_rhs_shared = Kokkos::View<double *>("d_rhs_shared",_num_rows_shared);
+      _d_rhs_indices_shared = Kokkos::View<HypreIntType *>("d_rhs_indices_shared",_num_rows_shared);
+      _h_rhs_shared = Kokkos::create_mirror_view(_d_rhs_shared);
+      _h_rhs_indices_shared = Kokkos::create_mirror_view(_d_rhs_indices_shared);
+      
+      /* set this flag */
+      _owned_shared_views_created = true;
+    }
+
+    /***************************************/
+    /* Move to owned/shared views          */
+    /***************************************/
+
+    auto d_rhs_indices_owned = _d_rhs_indices_owned;
+    auto d_rhs_owned = _d_rhs_owned;
+    auto d_rhs_indices_shared = _d_rhs_indices_shared;
+    auto d_rhs_shared = _d_rhs_shared;
+    auto num_rows_owned = _num_rows_owned;
+    auto num_rows_shared = _num_rows_shared;
+    auto iLowerLoc = iLowLoc.loc;
+
+    if (_iLower==0) {
+
+#ifdef HYPRE_RHS_ASSEMBLER_DEBUG
+      printf("Rank %d %s %s %d : name=%s : CASE 1\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
+#endif      
+
+      /* copy owned */
+      Kokkos::parallel_for("copy_owned", _num_rows_owned, KOKKOS_LAMBDA(const unsigned& i) {
+	  d_rhs_indices_owned(i) = d_rhs_indices(i);
+	  d_rhs_owned(i) = d_rhs(i);
+	});
+    
+      /* copy shared */
+      Kokkos::parallel_for("copy_shared", _num_rows_shared, KOKKOS_LAMBDA(const unsigned& i) {
+	  d_rhs_indices_shared(i) = d_rhs_indices(i+num_rows_owned);
+	  d_rhs_shared(i) = d_rhs(i+num_rows_owned);
+	});
+    
+    } else if (_iUpper+1==_global_num_rows) {
+
+#ifdef HYPRE_RHS_ASSEMBLER_DEBUG
+      printf("Rank %d %s %s %d : name=%s : CASE 2\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
+#endif      
+
+      /* copy shared */
+      Kokkos::parallel_for("copy_shared", _num_rows_shared, KOKKOS_LAMBDA(const unsigned& i) {
+	  d_rhs_indices_shared(i) = d_rhs_indices(i);
+	  d_rhs_shared(i) = d_rhs(i);
+	});
+      
+      /* copy shared */
+      Kokkos::parallel_for("copy_owned", _num_rows_owned, KOKKOS_LAMBDA(const unsigned& i) {
+	  d_rhs_indices_owned(i) = d_rhs_indices(i+num_rows_shared);
+	  d_rhs_owned(i) = d_rhs(i+num_rows_shared);
+	});
+
+    } else {
+
+#ifdef HYPRE_RHS_ASSEMBLER_DEBUG
+      printf("Rank %d %s %s %d : name=%s : CASE 3\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
+#endif      
+
+      /* copy shared lower */
+      Kokkos::parallel_for("copy_shared_lower", iLowerLoc, KOKKOS_LAMBDA(const unsigned& i) {
+	  d_rhs_indices_shared(i) = d_rhs_indices(i);
+	  d_rhs_shared(i) = d_rhs(i);
+      });
+      
+      /* copy shared upper */
+      auto shift = iLowerLoc+num_rows_owned;
+      Kokkos::parallel_for("copy_shared_upper", num_rows_shared-iLowerLoc, KOKKOS_LAMBDA(const unsigned& i) {
+	  d_rhs_indices_shared(i+iLowerLoc) = d_rhs_indices(i+shift);
+	  d_rhs_shared(i+iLowerLoc) = d_rhs(i+shift);
+	});
+
+      /* copy owned */
+      Kokkos::parallel_for("copy_owned", num_rows_owned, KOKKOS_LAMBDA(const unsigned& i) {
+	  d_rhs_indices_owned(i) = d_rhs_indices(i+iLowerLoc);
+	  d_rhs_owned(i) = d_rhs(i+iLowerLoc);
+	});   
+    } 
   }
-
-  /***************************************/
-  /* allocations, if not already created */
-  /***************************************/
-  if (!_owned_shared_views_created) {
-    _num_rows_owned = _num_rows_this_rank;
-    _num_rows_shared = _num_rows - _num_rows_owned;
-
-    _d_rhs_owned = Kokkos::View<double *>("d_rhs_owned",_num_rows_owned);
-    _d_rhs_indices_owned = Kokkos::View<HypreIntType *>("d_rhs_indices_owned",_num_rows_owned);
-    _h_rhs_owned = Kokkos::create_mirror_view(_d_rhs_owned);
-    _h_rhs_indices_owned = Kokkos::create_mirror_view(_d_rhs_indices_owned);
-
-    _d_rhs_shared = Kokkos::View<double *>("d_rhs_shared",_num_rows_shared);
-    _d_rhs_indices_shared = Kokkos::View<HypreIntType *>("d_rhs_indices_shared",_num_rows_shared);
-    _h_rhs_shared = Kokkos::create_mirror_view(_d_rhs_shared);
-    _h_rhs_indices_shared = Kokkos::create_mirror_view(_d_rhs_indices_shared);
-
-    /* set this flag */
-    _owned_shared_views_created = true;
-  }
-
-  /***************************************/
-  /* Move to owned/shared views          */
-  /***************************************/
-
-  auto d_rhs_indices_owned = _d_rhs_indices_owned;
-  auto d_rhs_owned = _d_rhs_owned;
-  auto d_rhs_indices_shared = _d_rhs_indices_shared;
-  auto d_rhs_shared = _d_rhs_shared;
-  auto num_rows_owned = _num_rows_owned;
-  auto num_rows_shared = _num_rows_shared;
-  auto iLowerLoc = iLowLoc.loc;
-
-  if (_iLower==0) {
-
-#ifdef HYPRE_RHS_ASSEMBLER_DEBUG
-  printf("Rank %d %s %s %d : name=%s : CASE 1\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
-#endif      
-
-    /* copy owned */
-    Kokkos::parallel_for("copy_owned", _num_rows_owned, KOKKOS_LAMBDA(const unsigned& i) {
-	d_rhs_indices_owned(i) = d_rhs_indices(i);
-	d_rhs_owned(i) = d_rhs(i);
-      });
-    
-    /* copy shared */
-    Kokkos::parallel_for("copy_shared", _num_rows_shared, KOKKOS_LAMBDA(const unsigned& i) {
-	d_rhs_indices_shared(i) = d_rhs_indices(i+num_rows_owned);
-	d_rhs_shared(i) = d_rhs(i+num_rows_owned);
-      });
-    
-  } else if (_iUpper+1==_global_num_rows) {
-
-#ifdef HYPRE_RHS_ASSEMBLER_DEBUG
-  printf("Rank %d %s %s %d : name=%s : CASE 2\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
-#endif      
-
-    /* copy shared */
-    Kokkos::parallel_for("copy_shared", _num_rows_shared, KOKKOS_LAMBDA(const unsigned& i) {
-	d_rhs_indices_shared(i) = d_rhs_indices(i);
-	d_rhs_shared(i) = d_rhs(i);
-      });
-    
-    /* copy shared */
-    Kokkos::parallel_for("copy_owned", _num_rows_owned, KOKKOS_LAMBDA(const unsigned& i) {
-	d_rhs_indices_owned(i) = d_rhs_indices(i+num_rows_shared);
-	d_rhs_owned(i) = d_rhs(i+num_rows_shared);
-      });
-
-  } else {
-
-#ifdef HYPRE_RHS_ASSEMBLER_DEBUG
-  printf("Rank %d %s %s %d : name=%s : CASE 3\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
-#endif      
-
-    /* copy shared lower */
-    Kokkos::parallel_for("copy_shared_lower", iLowerLoc, KOKKOS_LAMBDA(const unsigned& i) {
-	d_rhs_indices_shared(i) = d_rhs_indices(i);
-	d_rhs_shared(i) = d_rhs(i);
-      });
-
-    /* copy shared upper */
-    auto shift = iLowerLoc+num_rows_owned;
-    Kokkos::parallel_for("copy_shared_upper", num_rows_shared-iLowerLoc, KOKKOS_LAMBDA(const unsigned& i) {
-	d_rhs_indices_shared(i+iLowerLoc) = d_rhs_indices(i+shift);
-	d_rhs_shared(i+iLowerLoc) = d_rhs(i+shift);
-      });
-
-    /* copy owned */
-    Kokkos::parallel_for("copy_owned", num_rows_owned, KOKKOS_LAMBDA(const unsigned& i) {
-	d_rhs_indices_owned(i) = d_rhs_indices(i+iLowerLoc);
-	d_rhs_owned(i) = d_rhs(i+iLowerLoc);
-      });
-
-  } 
 
 #ifdef HYPRE_RHS_ASSEMBLER_TIMER
   Kokkos::fence();
   /* record the stop time */
+  gettimeofday(&_stop_refined, NULL);
+  _fillOwnedSharedTime += (float)(_stop_refined.tv_usec - _start_refined.tv_usec) / 1.e3 + 1.e3*((float)(_stop_refined.tv_sec - _start_refined.tv_sec));
+  
   gettimeofday(&_stop, NULL);
-  float msec = (float)(_stop.tv_usec - _start.tv_usec) / 1.e3 + 1.e3*((float)(_stop.tv_sec - _start.tv_sec));
-  _assembleTime+=msec;
-  _nAssemble++;
+  _assembleTime += (float)(_stop.tv_usec - _start.tv_usec) / 1.e3 + 1.e3*((float)(_stop.tv_sec - _start.tv_sec));
 #endif
 }
 
@@ -403,6 +433,8 @@ HypreCudaRhsAssembler::HypreCudaRhsAssembler(std::string name, bool ensureReprod
   /* create events */
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventCreate(&_start));
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventCreate(&_stop));
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventCreate(&_start_refined));
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventCreate(&_stop_refined));
 #endif
 
 #ifdef HYPRE_RHS_ASSEMBLER_DEBUG
@@ -417,12 +449,21 @@ HypreCudaRhsAssembler::~HypreCudaRhsAssembler() {
 
 #ifdef HYPRE_RHS_ASSEMBLER_TIMER
   printf("\nRank %d %s %s %d : name=%s\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
-  if (_nAssemble>0)
+  if (_nAssemble>0) {
     printf("Mean RHS Assembly Time (%d samples)=%1.5f msec, Data Xfer Time To Host=%1.5f msec\n",
 	   _nAssemble,_assembleTime/_nAssemble,_xferHostTime/_nAssemble);
+    printf("\tFill RHS Time (%d samples)=%1.5f msec\n",
+	   _nAssemble,_fillRhsTime/_nAssemble);
+    printf("\tFind Owned/Shared Boundary Time (%d samples)=%1.5f msec\n",
+	   _nAssemble,_findOwnedSharedBndryTime/_nAssemble);
+    printf("\tFill Owned/Shared Time (%d samples)=%1.5f msec\n",
+	   _nAssemble,_fillOwnedSharedTime/_nAssemble);
+  }
   /* destroy events */
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventDestroy(_start));
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventDestroy(_stop));
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventDestroy(_start_refined));
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventDestroy(_stop_refined));
 #endif
 
   /* free the data */
@@ -482,6 +523,8 @@ HypreCudaRhsAssembler::assemble(Kokkos::View<double **>& data, const int index) 
 #ifdef HYPRE_RHS_ASSEMBLER_TIMER
   /* record the start time */
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_start));
+  float t=0;
+  _nAssemble++;
 #endif
 
   _d_data = &data(0,index);
@@ -496,6 +539,7 @@ HypreCudaRhsAssembler::assemble(Kokkos::View<double **>& data, const int index) 
   if (_ensure_reproducible) {
     int num_threads=128;
     int threads_per_row = nextPowerOfTwo((_nDataPtsToAssemble + _num_rows - 1)/_num_rows);
+    if (threads_per_row>32) threads_per_row=32;
     //int threads_per_row = 1;
     int num_rows_per_block = num_threads/threads_per_row;
     int num_blocks = (_num_rows + num_rows_per_block - 1)/num_rows_per_block;
@@ -514,15 +558,33 @@ HypreCudaRhsAssembler::assemble(Kokkos::View<double **>& data, const int index) 
   ASSEMBLER_CUDA_SAFE_CALL(cudaMemcpy(_d_rhs_indices, _d_assembly_row_indices_ptr, 
 				      _num_rows*sizeof(HypreIntType), cudaMemcpyDeviceToDevice));
 
+#ifdef HYPRE_RHS_ASSEMBLER_TIMER
+  /* record the start time */
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_start_refined));
+#endif
+
   /* Step 2 : reduce the array and create the RHS Vector */
   int num_threads=128;
   int threads_per_row = nextPowerOfTwo((_nDataPtsToAssemble + _num_rows - 1)/_num_rows);
+  if (threads_per_row>32) threads_per_row=32;
   //int threads_per_row = 1;
   int num_rows_per_block = num_threads/threads_per_row;
   int num_blocks = (_num_rows + num_rows_per_block - 1)/num_rows_per_block;
 
   fillRhsVector<<<num_blocks,num_threads>>>(_num_rows, threads_per_row, _d_assembly_row_start_ptr, _d_data, _d_rhs);
   ASSEMBLER_CUDA_SAFE_CALL(cudaGetLastError());
+
+#ifdef HYPRE_RHS_ASSEMBLER_TIMER
+  /* record the stop time */
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_stop_refined));
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventSynchronize(_stop_refined));
+  t=0;
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventElapsedTime(&t, _start_refined, _stop_refined));
+  _fillRhsTime+=t;
+
+  /* record the start time */
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_start_refined));
+#endif
 
   /*******************************************************/
   /* Step 3 : split into owned and shared not-owned rows */
@@ -542,6 +604,19 @@ HypreCudaRhsAssembler::assemble(Kokkos::View<double **>& data, const int index) 
 							      min_abs_diff(_iUpper));
   HypreIntType iUppLoc = thrust::raw_pointer_cast(iUpperLoc)-_d_rhs_indices;    
   
+
+#ifdef HYPRE_RHS_ASSEMBLER_TIMER
+  /* record the stop time */
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_stop_refined));
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventSynchronize(_stop_refined));
+  t=0;
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventElapsedTime(&t, _start_refined, _stop_refined));
+  _findOwnedSharedBndryTime+=t;
+
+  /* record the start time */
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_start_refined));
+#endif
+
   
 #ifdef HYPRE_RHS_ASSEMBLER_DEBUG
   std::vector<HypreIntType> tmp(_num_rows);
@@ -552,102 +627,60 @@ HypreCudaRhsAssembler::assemble(Kokkos::View<double **>& data, const int index) 
   HypreIntType largest_row = tmp[_num_rows-1];
   HypreIntType largest_row_this_rank = tmp[iUppLoc];
 
-   printf("Rank %d %s %s %d : name=%s : iLowLoc=%lld, iUppLoc=%lld, all ranks: smallest=%lld, largest=%lld, this rank: smallest=%lld, largest=%lld\n",
-  	 _rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str(),iLowLoc,iUppLoc,smallest_row,largest_row,smallest_row_this_rank,largest_row_this_rank);
-
+  printf("Rank %d %s %s %d : name=%s : iLowLoc=%lld, iUppLoc=%lld, all ranks: smallest=%lld, largest=%lld, this rank: smallest=%lld, largest=%lld\n",
+    _rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str(),iLowLoc,iUppLoc,smallest_row,largest_row,smallest_row_this_rank,largest_row_this_rank);
 #endif      
 
-  if (_iLower==0) {
+  /* set these here */
+  _num_rows_owned = _num_rows_this_rank;
+  _num_rows_shared = _num_rows - _num_rows_owned;
+
+  /*******************************************************/
+  /* Consistency check : make sure things are consistent */
+  /*******************************************************/
+  _has_shared=false;
+  if (_num_rows_owned!=_num_rows) {
+    _has_shared = true;
+
+    if (_iLower==0) {
 
 #ifdef HYPRE_RHS_ASSEMBLER_DEBUG
-  printf("Rank %d %s %s %d : name=%s : CASE 1\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
+      printf("Rank %d %s %s %d : name=%s : CASE 1\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
 #endif      
-
-    /* need to throw an exception here as this is a catastrophic failure */
-    assert(_num_rows_this_rank==iUppLoc+1);
-
-    /* shared rhs vector exists under the following condition */
-    if (iUppLoc+1<_num_rows) _has_shared = true;
-
-    /* assert that this is always true */
-    _num_rows_owned = _num_rows_this_rank;
+      /* set the device/host owned pointers */
+      _d_rhs_indices_owned = _d_rhs_indices;
+      _d_rhs_owned = _d_rhs;
+      _h_rhs_indices_owned = _h_rhs_indices;
+      _h_rhs_owned = _h_rhs;
     
-    /* set the device/host owned pointers */
-    _d_rhs_indices_owned = _d_rhs_indices;
-    _d_rhs_owned = _d_rhs;
-    _h_rhs_indices_owned = _h_rhs_indices;
-    _h_rhs_owned = _h_rhs;
-    
-    /* shared rows is the diff between the total and the number on this rank */
-    if (_has_shared) {
-      _num_rows_shared = _num_rows - _num_rows_this_rank;
-      
       /* set the device/host shared pointers */
       _d_rhs_indices_shared = _d_rhs_indices + _num_rows_owned;
       _d_rhs_shared = _d_rhs+_num_rows_owned;
       _h_rhs_indices_shared = _h_rhs_indices + _num_rows_owned;
-      _h_rhs_shared = _h_rhs+_num_rows_owned;
-    } else {
-      _num_rows_shared = 0;
-      _d_rhs_indices_shared = NULL;
-      _d_rhs_shared = NULL;
-      _h_rhs_indices_shared = NULL;
-      _h_rhs_shared = NULL;
-    }
-    
-  } else if (_iUpper+1==_global_num_rows) {
+      _h_rhs_shared = _h_rhs+_num_rows_owned;    
+
+    } else if (_iUpper+1==_global_num_rows) {
 
 #ifdef HYPRE_RHS_ASSEMBLER_DEBUG
-  printf("Rank %d %s %s %d : name=%s : CASE 2\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
+      printf("Rank %d %s %s %d : name=%s : CASE 2\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
 #endif      
-
-    /* need to throw an exception here as this is a catastrophic failure */
-    assert(_num_rows_this_rank==_num_rows-iLowLoc);
-    
-    /* shared rhs vector exists under the following condition */
-    if (iLowLoc>0) _has_shared = true;
-    
-    /* shared rows is the diff between the total and the number on this rank */
-    if (_has_shared) {
-      _num_rows_shared = _num_rows - _num_rows_this_rank;
-
       /* set the device/host shared pointers */
       _d_rhs_indices_shared = _d_rhs_indices;
       _d_rhs_shared = _d_rhs;
       _h_rhs_indices_shared = _h_rhs_indices;
       _h_rhs_shared = _h_rhs;
+    
+      /* set the device/host owned pointers */
+      _d_rhs_indices_owned = _d_rhs_indices + _num_rows_shared;
+      _d_rhs_owned = _d_rhs + _num_rows_shared;
+      _h_rhs_indices_owned = _h_rhs_indices + _num_rows_shared;
+      _h_rhs_owned = _h_rhs + _num_rows_shared;
+      
     } else {
-      _num_rows_shared = 0;
-      _d_rhs_indices_shared = NULL;
-      _d_rhs_shared = NULL;
-      _h_rhs_indices_shared = NULL;
-      _h_rhs_shared = NULL;
-    }
-
-    /* assert that this is always true */
-    _num_rows_owned = _num_rows_this_rank;
-    
-    /* set the device/host owned pointers */
-    _d_rhs_indices_owned = _d_rhs_indices + _num_rows_shared;
-    _d_rhs_owned = _d_rhs + _num_rows_shared;
-    _h_rhs_indices_owned = _h_rhs_indices + _num_rows_shared;
-    _h_rhs_owned = _h_rhs + _num_rows_shared;
-    
-  } else {
 
 #ifdef HYPRE_RHS_ASSEMBLER_DEBUG
-  printf("Rank %d %s %s %d : name=%s : CASE 3\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
+      printf("Rank %d %s %s %d : name=%s : CASE 3\n",_rank,__FILE__,__FUNCTION__,__LINE__,_name.c_str());
 #endif      
-
-    /* need to throw an exception here as this is a catastrophic failure */
-    assert(_num_rows_this_rank==iUppLoc+1-iLowLoc);
-
-    /* shared matrix exists under the following condition */
-    if (iLowLoc>0 || iUppLoc+1<_num_rows) _has_shared = true;
-
-    /* assert that this is always true */
-    _num_rows_owned = _num_rows_this_rank;
-    _num_rows_shared = _num_rows - _num_rows_owned;
 
 #define SWAP_RHS(x1,x2,x3,n1,n2,n3,s) ( {					           \
 	HypreIntType bytes1 = n1*s;						           \
@@ -659,39 +692,45 @@ HypreCudaRhsAssembler::assemble(Kokkos::View<double **>& data, const int index) 
       }									                   \
       )									                   \
 
-    /* Only swap if there are shared entries above */
-    if (iLowLoc>0) {
-      HypreIntType n1 = iLowLoc, n2=iUppLoc+1-iLowLoc, n3= _nDataPtsToAssemble;
-      HypreIntType s = sizeof(HypreIntType);
-      SWAP_RHS(_d_rhs_indices, _d_rhs_indices+iLowLoc, (HypreIntType *)_d_workspace, n1, n2, n3, s);
+      /* Only swap if there are shared entries above */
+      if (iLowLoc>0) {
+	HypreIntType n1 = iLowLoc, n2=iUppLoc+1-iLowLoc, n3= _nDataPtsToAssemble;
+	HypreIntType s = sizeof(HypreIntType);
+	SWAP_RHS(_d_rhs_indices, _d_rhs_indices+iLowLoc, (HypreIntType *)_d_workspace, n1, n2, n3, s);
+	
+	s = sizeof(double);
+	SWAP_RHS(_d_rhs, _d_rhs+iLowLoc, (HypreIntType *)_d_workspace, n1, n2, n3, s);
+      }
 
-      s = sizeof(double);
-      SWAP_RHS(_d_rhs, _d_rhs+iLowLoc, (HypreIntType *)_d_workspace, n1, n2, n3, s);
+      /* set the device/host owned pointers */
+      _d_rhs_indices_owned = _d_rhs_indices;
+      _d_rhs_owned = _d_rhs;
+      
+      _h_rhs_indices_owned = _h_rhs_indices;
+      _h_rhs_owned = _h_rhs;
+      
+      _d_rhs_indices_shared = _d_rhs_indices_owned + _num_rows_this_rank;
+      _d_rhs_shared = _d_rhs_owned + _num_rows_this_rank;
+      
+      _h_rhs_indices_shared = _h_rhs_indices_owned + _num_rows_this_rank;
+      _h_rhs_shared = _h_rhs_owned + _num_rows_this_rank; 
     }
-
-    /* set the device/host owned pointers */
-    _d_rhs_indices_owned = _d_rhs_indices;
-    _d_rhs_owned = _d_rhs;
-
-    _h_rhs_indices_owned = _h_rhs_indices;
-    _h_rhs_owned = _h_rhs;
-
-    _d_rhs_indices_shared = _d_rhs_indices_owned + _num_rows_this_rank;
-    _d_rhs_shared = _d_rhs_owned + _num_rows_this_rank;
-
-    _h_rhs_indices_shared = _h_rhs_indices_owned + _num_rows_this_rank;
-    _h_rhs_shared = _h_rhs_owned + _num_rows_this_rank;
-
   }
 
 #ifdef HYPRE_RHS_ASSEMBLER_TIMER
-  /* record the stop time */
+  /* record the stop refined time */
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_stop_refined));
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventSynchronize(_stop_refined));
+  t=0;
+  ASSEMBLER_CUDA_SAFE_CALL(cudaEventElapsedTime(&t, _start_refined, _stop_refined));
+  _fillOwnedSharedTime+=t;
+
+  /* record the stop time for the whole method */
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventRecord(_stop));
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventSynchronize(_stop));
-  float t=0;
+  t=0;
   ASSEMBLER_CUDA_SAFE_CALL(cudaEventElapsedTime(&t, _start, _stop));
   _assembleTime+=t;
-  _nAssemble++;
 #endif
 }
 
