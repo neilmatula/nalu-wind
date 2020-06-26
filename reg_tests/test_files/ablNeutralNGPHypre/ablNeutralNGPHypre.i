@@ -22,6 +22,7 @@ linear_solvers:
     segregated_solver: yes
     ensure_reproducible: no
     use_native_cuda_assembly: no
+    use_kokkos_assembly: yes
     write_matrix_files: no
 
   # solver for the pressure
@@ -38,6 +39,7 @@ linear_solvers:
     bamg_cycle_type: 1
     ensure_reproducible: no
     use_native_cuda_assembly: no
+    use_kokkos_assembly: yes
     write_matrix_files:  no
 
 realms:

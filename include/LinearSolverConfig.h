@@ -53,6 +53,9 @@ public:
   inline bool useNativeCudaAssembly() const
   { return useNativeCudaAssembly_; }
 
+  inline bool useKokkosAssembly() const
+  { return useKokkosAssembly_; }
+
   inline bool recomputePreconditioner() const
   { return recomputePreconditioner_; }
 
@@ -93,6 +96,7 @@ protected:
   bool writeMatrixFiles_{false};
   bool ensureReproducible_{false};
   bool useNativeCudaAssembly_{true};
+  bool useKokkosAssembly_{false};
 };
 
 class TpetraLinearSolverConfig : public LinearSolverConfig

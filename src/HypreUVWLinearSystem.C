@@ -134,29 +134,31 @@ HypreUVWLinearSystem::loadComplete()
   // TODO: Alternate design to eliminate dummy rows. This will require
   // load-balancing on HYPRE end.
 
-#ifdef KOKKOS_ENABLE_CUDA
+  HypreUVWSolver* solver = reinterpret_cast<HypreUVWSolver*>(linearSolver_);
+  bool useKokkosAssembly = solver->getConfig()->useKokkosAssembly();
 
-  std::vector<void *> rhs(nDim_);
-  for (unsigned i=0; i<nDim_; ++i) rhs[i] = (void*)(&rhs_[i]);
+  if (useKokkosAssembly) {
+    
+    std::vector<void *> rhs(nDim_);
+    for (unsigned i=0; i<nDim_; ++i) rhs[i] = (void*)(&rhs_[i]);
+    
+    hostCoeffApplier->finishAssembly((void*)&mat_, rhs, name_);
+    
+  } else {
 
-  hostCoeffApplier->finishAssembly((void*)&mat_, rhs, name_);
-
-#else
-
-  HypreIntType hnrows = 1;
-  HypreIntType hncols = 1;
-  double getval;
-  double setval = 1.0;
-  for (HypreIntType i=0; i < numRows_; i++) {
-    if (rowFilled_[i] == RS_FILLED) continue;
-    HypreIntType lid = iLower_ + i;
-    HYPRE_IJMatrixGetValues(mat_, hnrows, &hncols, &lid, &lid, &getval);
-    if (std::fabs(getval) < 1.0e-12) {
-      HYPRE_IJMatrixSetValues(mat_, hnrows, &hncols, &lid, &lid, &setval);
+    HypreIntType hnrows = 1;
+    HypreIntType hncols = 1;
+    double getval;
+    double setval = 1.0;
+    for (HypreIntType i=0; i < numRows_; i++) {
+      if (rowFilled_[i] == RS_FILLED) continue;
+      HypreIntType lid = iLower_ + i;
+      HYPRE_IJMatrixGetValues(mat_, hnrows, &hncols, &lid, &lid, &getval);
+      if (std::fabs(getval) < 1.0e-12) {
+	HYPRE_IJMatrixSetValues(mat_, hnrows, &hncols, &lid, &lid, &setval);
+      }
     }
   }
-
-#endif
 
   loadCompleteSolver();
 }
@@ -227,7 +229,6 @@ HypreUVWLinearSystem::sumInto(
   const SharedMemView<int*, DeviceShmem>&,
   const char*  /* trace_tag */)
 {
-#ifndef KOKKOS_ENABLE_CUDA
   HypreIntType numRows = numEntities;
   const HypreIntType bufSize = idBuffer_.size();
 
@@ -269,7 +270,6 @@ HypreUVWLinearSystem::sumInto(
     if ((hid >= iLower_) && (hid <= iUpper_))
       rowFilled_[hid - iLower_] = RS_FILLED;
   }
-#endif
 }
 
 void
@@ -336,45 +336,44 @@ HypreUVWLinearSystem::applyDirichletBCs(
 {
   double adbc_time = -NaluEnv::self().nalu_time();
 
-#ifdef KOKKOS_ENABLE_CUDA
+  HypreUVWSolver* solver = reinterpret_cast<HypreUVWSolver*>(linearSolver_);
+  bool useKokkosAssembly = solver->getConfig()->useKokkosAssembly();
 
-  hostCoeffApplier->applyDirichletBCs(realm_, solutionField, bcValuesField, parts);
+  if (useKokkosAssembly) {
 
-#else 
+    hostCoeffApplier->applyDirichletBCs(realm_, solutionField, bcValuesField, parts);
 
-  auto& meta = realm_.meta_data();
+  } else {
 
-  const stk::mesh::Selector sel = (
-    meta.locally_owned_part() &
-    stk::mesh::selectUnion(parts) &
-    stk::mesh::selectField(*solutionField) &
-    !(realm_.get_inactive_selector()));
+    auto& meta = realm_.meta_data();
 
-  const auto& bkts = realm_.get_buckets(
-    stk::topology::NODE_RANK, sel);
+    const stk::mesh::Selector sel = (meta.locally_owned_part() &
+				     stk::mesh::selectUnion(parts) &
+				     stk::mesh::selectField(*solutionField) &
+				     !(realm_.get_inactive_selector()));
+    
+    const auto& bkts = realm_.get_buckets(stk::topology::NODE_RANK, sel);
+    
+    HypreIntType ncols = 1;
+    double diag_value = 1.0;
+    for (auto b: bkts) {
+      const double* solution = (double*)stk::mesh::field_data(*solutionField, *b);
+      const double* bcValues = (double*)stk::mesh::field_data(*bcValuesField, *b);
 
-  HypreIntType ncols = 1;
-  double diag_value = 1.0;
-  for (auto b: bkts) {
-    const double* solution = (double*)stk::mesh::field_data(
-      *solutionField, *b);
-    const double* bcValues = (double*)stk::mesh::field_data(
-      *bcValuesField, *b);
-
-    for (size_t in=0; in < b->size(); in++) {
-      auto node = (*b)[in];
-      HypreIntType hid = *stk::mesh::field_data(*realm_.hypreGlobalId_, node);
-
-      HYPRE_IJMatrixSetValues(mat_, 1, &ncols, &hid, &hid, &diag_value);
-
-      for (unsigned d=0; d<nDim_; ++d) {
-        double bcval = bcValues[in*nDim_ + d] - solution[in*nDim_ + d];
-        HYPRE_IJVectorSetValues(rhs_[d], 1, &hid, &bcval);
+      for (size_t in=0; in < b->size(); in++) {
+	auto node = (*b)[in];
+	HypreIntType hid = *stk::mesh::field_data(*realm_.hypreGlobalId_, node);
+	
+	HYPRE_IJMatrixSetValues(mat_, 1, &ncols, &hid, &hid, &diag_value);
+	
+	for (unsigned d=0; d<nDim_; ++d) {
+	  double bcval = bcValues[in*nDim_ + d] - solution[in*nDim_ + d];
+	  HYPRE_IJVectorSetValues(rhs_[d], 1, &hid, &bcval);
+	}
+	rowFilled_[hid - iLower_] = RS_FILLED;
       }
-      rowFilled_[hid - iLower_] = RS_FILLED;
     }
   }
-#endif
 
   adbc_time += NaluEnv::self().nalu_time();
 }
@@ -516,32 +515,35 @@ HypreUVWLinearSystem::copy_hypre_to_stk(
 
 sierra::nalu::CoeffApplier* HypreUVWLinearSystem::get_coeff_applier()
 {
-#ifdef KOKKOS_ENABLE_CUDA
 
-  if (!hostCoeffApplier) {
-    /***************************/
-    /* Build the coeff applier */
-    HypreUVWSolver* solver = reinterpret_cast<HypreUVWSolver*>(linearSolver_);
-    bool ensureReproducible = solver->getConfig()->ensureReproducible();
-    bool useNativeCudaAssembly = solver->getConfig()->useNativeCudaAssembly();
+  HypreUVWSolver* solver = reinterpret_cast<HypreUVWSolver*>(linearSolver_);
+  bool useKokkosAssembly = solver->getConfig()->useKokkosAssembly();
 
-    hostCoeffApplier.reset(new HypreUVWLinSysCoeffApplier(useNativeCudaAssembly, ensureReproducible, nDim_, globalNumRows_, 
-							  rank_, iLower_, iUpper_, jLower_, jUpper_,
-							  memory_map_, row_indices_, mat_row_start_, rhs_row_start_,
-							  numMatPtsToAssembleTotal_, numRhsPtsToAssembleTotal_,
-							  periodic_bc_rows_, entityToLID_, skippedRowsMap_));
-    deviceCoeffApplier = hostCoeffApplier->device_pointer();
+  if (useKokkosAssembly) {
+
+    if (!hostCoeffApplier) {
+      /***************************/
+      /* Build the coeff applier */
+      bool ensureReproducible = solver->getConfig()->ensureReproducible();
+      bool useNativeCudaAssembly = solver->getConfig()->useNativeCudaAssembly();
+      
+      hostCoeffApplier.reset(new HypreUVWLinSysCoeffApplier(useNativeCudaAssembly, ensureReproducible, nDim_, globalNumRows_, 
+							    rank_, iLower_, iUpper_, jLower_, jUpper_,
+							    memory_map_, row_indices_, mat_row_start_, rhs_row_start_,
+							    numMatPtsToAssembleTotal_, numRhsPtsToAssembleTotal_,
+							    periodic_bc_rows_, entityToLID_, skippedRowsMap_));
+      deviceCoeffApplier = hostCoeffApplier->device_pointer();
+    }
+    
+    /* reset the internal counters */
+    hostCoeffApplier->resetInternalData();
+    return deviceCoeffApplier;
+
+  } else {
+
+    return LinearSystem::get_coeff_applier();
+
   }
-
-  /* reset the internal counters */
-  hostCoeffApplier->resetInternalData();
-  return deviceCoeffApplier;
-
-#else
-
-  return LinearSystem::get_coeff_applier();
-
-#endif
 }
 
 /********************************************************************************************************/
@@ -732,25 +734,19 @@ HypreUVWLinearSystem::HypreUVWLinSysCoeffApplier::applyDirichletBCs(Realm & real
 
 void HypreUVWLinearSystem::HypreUVWLinSysCoeffApplier::free_device_pointer()
 {
-#ifdef KOKKOS_ENABLE_CUDA
   if (this != devicePointer_) {
     sierra::nalu::kokkos_free_on_device(devicePointer_);
     devicePointer_ = nullptr;
   }
-#endif
 }
 
 sierra::nalu::CoeffApplier* HypreUVWLinearSystem::HypreUVWLinSysCoeffApplier::device_pointer()
 {
-#ifdef KOKKOS_ENABLE_CUDA
   if (devicePointer_ != nullptr) {
     sierra::nalu::kokkos_free_on_device(devicePointer_);
     devicePointer_ = nullptr;
   }
   devicePointer_ = sierra::nalu::create_device_expression(*this);
-#else
-  devicePointer_ = this;
-#endif
   return devicePointer_;
 }
 

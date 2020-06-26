@@ -177,7 +177,6 @@ public:
 
     KOKKOS_FUNCTION
     virtual ~HypreLinSysCoeffApplier() {
-#ifdef KOKKOS_ENABLE_CUDA
 
       if (matAssembler_) { delete matAssembler_; matAssembler_=NULL; }
       if (rhsAssembler_) { delete rhsAssembler_; rhsAssembler_=NULL; }
@@ -189,7 +188,6 @@ public:
 	printf("\tMean HYPRE_IJVectorSetValues Time (%d samples)=%1.5f   Total=%1.5f\n",
 	       _nAssembleRhs, _assembleRhsTime/_nAssembleRhs,_assembleRhsTime);
       }
-#endif
 #endif
     }
 
@@ -301,8 +299,6 @@ public:
     //! Flag indicating that sumInto should check to see if rows must be skipped
     HypreIntTypeViewScalar checkSkippedRows_;
 
-#ifdef KOKKOS_ENABLE_CUDA
-
     /* The new version */
     HypreRhsAssembler * rhsAssembler_=nullptr;
     HypreMatrixAssembler * matAssembler_=nullptr;
@@ -311,7 +307,6 @@ public:
     float _assembleRhsTime=0.f;
     int _nAssembleMat=0;
     int _nAssembleRhs=0;
-#endif
   };
 
   /***************************************************************************************************/
